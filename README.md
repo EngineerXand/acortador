@@ -113,3 +113,62 @@ Con un Redis local en el puerto 6379:
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
+
+---
+
+# Fase 3 — Réplicas + balanceador de carga
+
+```
+Cliente → Nginx (:8001) → api ×3 (round-robin) → Redis
+```
+
+## Cómo correrlo
+
+```bash
+docker compose up --build
+```
+
+Ahora el único punto de entrada es **http://localhost:8001** (Nginx). Las 3
+réplicas de la API no exponen puertos hacia afuera. Para cambiar el número
+de réplicas, editen `replicas:` en `docker-compose.yml`.
+
+## Demostraciones (para el informe)
+
+**1. Reparto de carga y unicidad de IDs**
+```bash
+python scripts/probar_fase3.py
+```
+Hace 30 peticiones a `/health` (cada respuesta trae el `instancia` que la
+atendió) y luego 200 acortados en paralelo. Debe mostrar un reparto parejo
+(~10/10/10) y 200 códigos únicos.
+
+**2. Tolerancia a fallos de una réplica**
+```bash
+docker compose ps                      # ver los nombres de las réplicas
+docker stop acortador-api-1            # tumbar una (ajusten el nombre)
+python scripts/probar_fase3.py         # sigue funcionando, reparto 15/15
+docker start acortador-api-1           # vuelve a entrar sola
+```
+
+**3. Ver qué réplica atendió una petición**
+```bash
+curl -i http://localhost:8001/health   # cabecera X-Upstream + campo "instancia"
+```
+
+## Qué aprendimos / decisiones
+
+- **El generador de IDs sigue siendo correcto con varias réplicas** porque el
+  contador vive en Redis (`INCR` es atómico) y no en la memoria de cada API.
+  Si el contador estuviera en cada réplica, habría códigos repetidos.
+- **Las réplicas no guardan estado** (*stateless*): todo está en Redis. Por
+  eso se pueden crear, matar o reemplazar sin perder datos.
+- **Nginx re-consulta el DNS de Docker cada 5 s** (`resolver` + variable en
+  `proxy_pass`), así detecta réplicas nuevas o reiniciadas.
+- **`proxy_next_upstream`**: si una réplica falla a media petición, Nginx
+  reintenta con otra.
+
+## Limitaciones (siguiente fase)
+
+- **Redis es ahora el punto único de falla**: si cae, las 3 réplicas quedan
+  inservibles. Se corrige con replicación (Redis réplica + Sentinel).
+- Nginx también es un punto único de falla (en producción habría varios).
