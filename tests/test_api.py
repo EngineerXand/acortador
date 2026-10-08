@@ -76,3 +76,17 @@ def test_health(cliente):
     r = cliente.get("/health")
     assert r.status_code == 200
     assert r.json()["redis"] == "ok"
+
+
+def test_redis_caido_devuelve_503(cliente):
+    import redis
+
+    def roto():
+        raise redis.ConnectionError("simulado")
+
+    app.dependency_overrides[obtener_almacen] = lambda: type(
+        "Roto", (), {"guardar": staticmethod(lambda url: roto())}
+    )()
+    r = cliente.post("/shorten", json={"url": "https://ejemplo.com"})
+    assert r.status_code == 503
+    assert r.headers["retry-after"] == "2"

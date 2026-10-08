@@ -12,6 +12,7 @@ Estructura de claves en Redis:
 from datetime import datetime, timezone
 
 import redis
+from redis.sentinel import Sentinel
 
 from . import base62, config
 
@@ -72,6 +73,16 @@ class Almacen:
 
 
 def crear_cliente() -> redis.Redis:
+    if config.REDIS_SENTINELS:
+        # Sentinel: en cada (re)conexión se le pregunta quién es el maestro,
+        # así tras un failover el cliente encuentra solo al nuevo maestro.
+        sentinels = [
+            (host, int(port))
+            for host, port in (s.split(":") for s in config.REDIS_SENTINELS.split(","))
+        ]
+        return Sentinel(sentinels, socket_timeout=0.5, decode_responses=True).master_for(
+            config.REDIS_MASTER, socket_timeout=0.5
+        )
     return redis.Redis(
         host=config.REDIS_HOST,
         port=config.REDIS_PORT,

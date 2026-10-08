@@ -172,3 +172,121 @@ curl -i http://localhost:8001/health   # cabecera X-Upstream + campo "instancia"
 - **Redis es ahora el punto único de falla**: si cae, las 3 réplicas quedan
   inservibles. Se corrige con replicación (Redis réplica + Sentinel).
 - Nginx también es un punto único de falla (en producción habría varios).
+
+---
+
+# Fase 4 — Alta disponibilidad de Redis (réplica + Sentinel)
+
+```
+Cliente → Nginx → api ×3 ──pregunta──▶ Sentinel ×3 (vigilan)
+                     │                      │
+                     └──────── escribe ──▶ Redis MAESTRO ──replica──▶ Redis RÉPLICA
+```
+
+## Cómo correrlo
+
+```bash
+docker compose down -v --remove-orphans   # IMPORTANTE: limpia contenedores y volúmenes de fases anteriores
+docker compose up --build
+```
+
+Ahora hay 8 contenedores de infraestructura: Nginx, 3 APIs, Redis maestro,
+Redis réplica y 3 Sentinels.
+
+## Demostración del failover (para el informe)
+
+**Terminal 1** — inicia la prueba (acorta una URL cada 0.2 s durante 90 s):
+```bash
+python scripts/probar_fase4.py
+```
+
+**Terminal 2** — a los ~10 s, tumben el maestro:
+```bash
+docker stop acortador-redis-master-1
+```
+
+La Terminal 1 mostrará algo como:
+```
+[  8.2s] FALLO (HTTP 503): el servicio no puede escribir
+[ 12.5s] Servicio RECUPERADO tras 4.3 s de caída
+Perdidos (confirmados pero ya no existen): 0
+```
+
+**Ver quién es el maestro ahora:**
+```bash
+docker compose exec sentinel-1 redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
+```
+
+**Revivir el maestro viejo** (vuelve como *réplica* del nuevo, tarda hasta ~10 s):
+```bash
+docker start acortador-redis-master-1
+docker compose exec redis-master redis-cli info replication   # role:slave
+```
+
+## Cómo funciona
+
+1. El **maestro** recibe todas las escrituras y las copia a la **réplica**.
+2. Los 3 **Sentinels** hacen ping al maestro. Si uno deja de responder 3 s
+   (`down-after-milliseconds`), cada Sentinel lo marca como "caído".
+3. Con **quórum 2 de 3** (la mayoría) se declara el maestro caído y los
+   Sentinels eligen un líder que **promueve a la réplica** a maestro.
+4. Las APIs no tienen la dirección de Redis fija: en cada (re)conexión le
+   preguntan a Sentinel quién es el maestro (`REDIS_SENTINELS`), así encuentran
+   al nuevo solas. Mientras dura el failover responden `503` con
+   `Retry-After` en vez de un `500` confuso.
+
+## Problema real que encontramos: Sentinel en modo TILT
+
+En la primera versión Redis y los Sentinels se encontraban por **nombre**
+(`redis-master`). Al tumbar el maestro, **el failover nunca ocurría**. Los
+logs de Sentinel mostraban, cada ~7 s:
+
+```
+# Failed to resolve hostname 'redis-master'
+# +tilt #tilt mode entered
+```
+
+Qué pasaba:
+1. Al detenerse un contenedor, Docker borra su nombre del DNS interno.
+2. Cada vez que Sentinel intenta resolver el nombre perdido, la consulta
+   **bloquea su único hilo** varios segundos.
+3. Sentinel detecta que su reloj "se atrasó" y entra en **modo TILT**: por
+   seguridad deja de tomar decisiones (**no hace failover**) durante 30 s.
+4. Pero cada nuevo intento de resolución lo vuelve a meter en TILT: nunca sale.
+
+Solución: **IPs fijas** (`172.28.0.10` maestro, `.11` réplica, `.21-.23`
+Sentinels) en una red con subred propia. Sin DNS no hay bloqueo, y el failover
+se completa en pocos segundos.
+
+Lección: en sistemas distribuidos, **resolver nombres puede ser parte de la ruta
+crítica de recuperación**, y una dependencia lenta (DNS) puede convertir un
+fallo breve en una caída larga. Detectarlo requirió leer los logs, no solo
+ver que "no se recuperaba".
+
+## Decisiones y teoría (CAP)
+
+- **¿Por qué 3 Sentinels y quórum 2?** Con uno solo, si el propio Sentinel cae
+  no hay quién vigile; con 2 no hay mayoría posible si uno cae. Con 3 se
+  tolera la caída de 1. El quórum evita que un Sentinel aislado por un fallo
+  de red declare caído a un maestro sano (**split brain**: dos maestros a la vez).
+- **Elegimos disponibilidad sobre consistencia fuerte.** La replicación de
+  Redis es **asíncrona**: el maestro responde "OK" antes de que la réplica
+  confirme. Si el maestro muere justo después de aceptar una escritura que aún
+  no copió, esa escritura se pierde. En nuestras pruebas con tráfico continuo
+  no se perdió ninguna (la réplica copia en milisegundos), pero la garantía
+  teórica es de **consistencia eventual**, no absoluta.
+- **Si se pierde el contador de IDs** (peor caso, mismo escenario), el nuevo
+  maestro podría reutilizar un código cuyo enlace también se perdió. Mitigación
+  posible (no implementada): comando `WAIT 1 100` tras cada escritura para
+  esperar la confirmación de la réplica, pagando latencia.
+- La réplica **solo** sirve para failover, no para repartir lecturas: todas las
+  operaciones (incluso las redirecciones) van al maestro porque cada una suma
+  un clic.
+
+## Limitaciones
+
+- Nginx sigue siendo un punto único de falla.
+- Durante el failover (~4-10 s) no se puede escribir; se pierde disponibilidad
+  de forma breve pero real.
+- Los datos de cada Redis siguen en un solo disco/volumen: no hay *sharding*
+  (posible Fase 5: partir los datos entre varios maestros con *consistent hashing*).

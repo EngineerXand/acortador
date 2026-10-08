@@ -8,7 +8,8 @@ Endpoints:
 """
 
 from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+import redis
 from pydantic import BaseModel, HttpUrl
 
 from . import config
@@ -32,6 +33,17 @@ def obtener_almacen() -> Almacen:
     if _almacen is None:
         _almacen = Almacen(crear_cliente())
     return _almacen
+
+
+@app.exception_handler(redis.RedisError)
+def almacen_no_disponible(request, exc):
+    # Durante un failover (unos segundos) Redis no responde: en vez de un
+    # 500 confuso, avisamos "temporalmente no disponible, reintente".
+    return JSONResponse(
+        {"detail": "Almacenamiento no disponible, reintente"},
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        headers={"Retry-After": "2"},
+    )
 
 
 # ---------- Modelos de entrada y salida ----------

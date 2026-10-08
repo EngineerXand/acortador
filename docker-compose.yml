@@ -1,3 +1,32 @@
+# Fase 4: Nginx -> api x3 -> Redis maestro + réplica, vigilados por 3 Sentinels.
+#
+# IMPORTANTE: Redis y Sentinels usan IPs FIJAS, no nombres. Cuando un contenedor
+# se detiene, Docker borra su nombre del DNS y cada consulta de ese nombre bloquea
+# a Sentinel varios segundos; Sentinel interpreta ese bloqueo como un fallo de su
+# reloj y entra en modo TILT, en el que NO hace failover (ver README, Fase 4).
+
+x-sentinel: &sentinel
+  image: redis:7-alpine
+  # Sentinel reescribe su archivo de configuración, por eso se genera al
+  # arrancar en un lugar escribible. Quórum 2 de 3: dos Sentinels deben
+  # coincidir en que el maestro cayó antes de hacer failover.
+  command:
+    - sh
+    - -c
+    - |
+      cat > /tmp/sentinel.conf <<EOF
+      port 26379
+      sentinel monitor mymaster 172.28.0.10 6379 2
+      sentinel down-after-milliseconds mymaster 3000
+      sentinel failover-timeout mymaster 10000
+      sentinel parallel-syncs mymaster 1
+      EOF
+      exec redis-server /tmp/sentinel.conf --sentinel
+  depends_on:
+    - redis-master
+    - redis-replica
+  restart: unless-stopped
+
 services:
   nginx:
     image: nginx:1.27-alpine
@@ -11,26 +40,26 @@ services:
 
   api:
     build: .
-    # Sin "ports": solo Nginx es accesible desde fuera.
-    # Cambien el número para tener más o menos réplicas.
     deploy:
       replicas: 3
     environment:
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      REDIS_SENTINELS: 172.28.0.21:26379,172.28.0.22:26379,172.28.0.23:26379
+      REDIS_MASTER: mymaster
       BASE_URL: http://localhost:8001
     depends_on:
-      redis:
-        condition: service_healthy
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3
     restart: unless-stopped
 
-  redis:
+  redis-master:
     image: redis:7-alpine
-    # appendonly: Redis escribe cada operación a disco, así los enlaces
-    # sobreviven si el contenedor se reinicia.
+    networks:
+      default:
+        ipv4_address: 172.28.0.10
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - redis-datos:/data
+      - redis-master-datos:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -38,5 +67,42 @@ services:
       retries: 5
     restart: unless-stopped
 
+  redis-replica:
+    image: redis:7-alpine
+    networks:
+      default:
+        ipv4_address: 172.28.0.11
+    # Copia en tiempo real al maestro. Si el maestro cae, Sentinel la
+    # promueve a maestro.
+    command: ["redis-server", "--appendonly", "yes", "--replicaof", "172.28.0.10", "6379"]
+    volumes:
+      - redis-replica-datos:/data
+    depends_on:
+      - redis-master
+    restart: unless-stopped
+
+  sentinel-1:
+    <<: *sentinel
+    networks:
+      default:
+        ipv4_address: 172.28.0.21
+  sentinel-2:
+    <<: *sentinel
+    networks:
+      default:
+        ipv4_address: 172.28.0.22
+  sentinel-3:
+    <<: *sentinel
+    networks:
+      default:
+        ipv4_address: 172.28.0.23
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
 volumes:
-  redis-datos:
+  redis-master-datos:
+  redis-replica-datos:
